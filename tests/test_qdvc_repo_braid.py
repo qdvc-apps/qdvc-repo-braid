@@ -1,4 +1,4 @@
-"""Tests for git-braid. Run from the project root:
+"""Tests for qdvc-repo-braid. Run from the project root:
 
     python3 -m unittest discover -s tests -v
 
@@ -17,12 +17,12 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "git-braid")
+SCRIPT = os.path.join(os.path.dirname(HERE), "qdvc-repo-braid")
 
-# The script has no .py extension (so it works as `git braid`), so load it
-# explicitly for the unit tests.
-_loader = importlib.machinery.SourceFileLoader("git_braid", SCRIPT)
-_spec = importlib.util.spec_from_loader("git_braid", _loader)
+# The script has no .py extension (so it can be symlinked as a Git
+# subcommand), so load it explicitly for the unit tests.
+_loader = importlib.machinery.SourceFileLoader("qdvc_repo_braid", SCRIPT)
+_spec = importlib.util.spec_from_loader("qdvc_repo_braid", _loader)
 gb = importlib.util.module_from_spec(_spec)
 _loader.exec_module(gb)
 
@@ -103,9 +103,9 @@ class BraidTestCase(unittest.TestCase):
         out = proc.stdout.decode("utf-8", "replace")
         err = proc.stderr.decode("utf-8", "replace")
         if expect_ok and proc.returncode != 0:
-            self.fail("git-braid failed:\n" + err)
+            self.fail("qdvc-repo-braid failed:\n" + err)
         if not expect_ok and proc.returncode == 0:
-            self.fail("git-braid unexpectedly succeeded:\n" + err)
+            self.fail("qdvc-repo-braid unexpectedly succeeded:\n" + err)
         return out, err
 
     def mono(self, *args):
@@ -242,12 +242,12 @@ class TestBasics(BraidTestCase):
         mac, gtk = self.two_simple()
         self.braid("mac=" + mac.path, "gtk4=" + gtk.path, "-o", self.out)
         self.assertTrue(os.path.exists(
-            os.path.join(self.out, ".git", "braid-commit-map.tsv")))
+            os.path.join(self.out, ".git", "repo-braid-commit-map.tsv")))
 
     def test_import_refs_removed_and_originals_pruned(self):
         mac, gtk = self.two_simple()
         self.braid("mac=" + mac.path, "gtk4=" + gtk.path, "-o", self.out)
-        self.assertEqual(self.mono("for-each-ref", "refs/braid-import/"), "")
+        self.assertEqual(self.mono("for-each-ref", "refs/repo-braid-import/"), "")
         orig = mac.git("rev-parse", "HEAD")
         proc = subprocess.run(["git", "cat-file", "-e", orig], cwd=self.out)
         self.assertNotEqual(proc.returncode, 0)
@@ -256,7 +256,7 @@ class TestBasics(BraidTestCase):
         mac, gtk = self.two_simple()
         self.braid("mac=" + mac.path, "gtk4=" + gtk.path, "-o", self.out,
                    "--keep-import-refs")
-        self.assertIn("refs/braid-import/0/head",
+        self.assertIn("refs/repo-braid-import/0/head",
                       self.mono("for-each-ref", "--format=%(refname)"))
 
     def test_dry_run_creates_nothing(self):

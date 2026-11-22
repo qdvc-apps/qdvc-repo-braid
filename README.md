@@ -1,4 +1,4 @@
-# qdvc-git-braid
+# qdvc-repo-braid
 
 Merge two (or more) Git repositories into one new monorepo **as if it had
 always been a monorepo**. Each repository's history is rewritten so its files
@@ -25,7 +25,7 @@ standard library only.
 ## Quick start
 
 ```sh
-./git-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 -o ../MyApp
+./qdvc-repo-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 -o ../MyApp
 ```
 
 Your source repositories are never modified. The output folder must not exist
@@ -35,20 +35,27 @@ branch each one has checked out is used.
 Preview the interleaved order first, without creating anything:
 
 ```sh
-./git-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 -o ../MyApp --dry-run
+./qdvc-repo-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 -o ../MyApp --dry-run
 ```
 
-### Using it as `git braid`
+### Using it as a Git subcommand (optional)
 
-Put the folder containing `git-braid` on your `PATH` and Git picks it up as a
-subcommand: `git braid mac=... gtk4=... -o ...`. Use `git braid -h` for help;
-`git braid --help` makes Git look for a man page instead.
+Git runs any executable named `git-<name>` on your `PATH` as `git <name>`.
+To get `git repo-braid`, add a symlink somewhere on your `PATH`:
+
+```sh
+ln -s "$PWD/qdvc-repo-braid" ~/.local/bin/git-repo-braid
+git repo-braid mac=... gtk4=... -o ...
+```
+
+Use `git repo-braid -h` for help; `git repo-braid --help` makes Git look for
+a man page instead.
 
 ### Requirements
 
 - Python 3.8 or newer (the `python3` from Xcode Command Line Tools is fine).
 - Git on `PATH`. Tested with Git 2.43; anything from 2.15 onwards should work.
-- Windows: run it as `python git-braid ...`. If paths get long, enable
+- Windows: run it as `python qdvc-repo-braid ...`. If paths get long, enable
   `git config --global core.longpaths true`.
 
 ## Options
@@ -65,10 +72,10 @@ subcommand: `git braid mac=... gtk4=... -o ...`. Use `git braid -h` for help;
 | `--trailer` | Add `Braided-From: FOLDER OLD-COMMIT-ID` to each message. |
 | `--tag-prefix '{folder}/'` | How imported tags are renamed (default: `v1.0` → `mac/v1.0`). |
 | `--no-tags` | Don't import tags. |
-| `--map-file PATH` | Where to write the old → new commit ID table (default `.git/braid-commit-map.tsv`). |
+| `--map-file PATH` | Where to write the old → new commit ID table (default `.git/repo-braid-commit-map.tsv`). |
 | `--dry-run` | Print the planned order and exit. |
 | `--no-checkout`, `--no-gc` | Skip populating the working tree / packing at the end. |
-| `--keep-import-refs` | Keep the original histories under `refs/braid-import/` for comparison. |
+| `--keep-import-refs` | Keep the original histories under `refs/repo-braid-import/` for comparison. |
 
 ## How it works
 
