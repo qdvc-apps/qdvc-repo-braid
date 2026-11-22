@@ -1,0 +1,896 @@
+#!/usr/bin/env python3
+"""git-braid: replay several Git repositories into one monorepo.
+
+Each source repository's history is rewritten so that its files live under a
+folder of your choosing (for example ``mac/`` and ``gtk4/``), and the commits
+from all sources are interleaved by date into a single history, as if the
+monorepo had existed from the start.
+
+    git-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 -o ../MyApp
+
+Part of the QDVC suite (https://github.com/qdvc-apps). Standard library only;
+needs Python 3.8+ and Git 2.20+ on PATH. Source repositories are never
+modified: their objects are fetched into the new repository and new commit
+objects are written there.
+"""
+
+import argparse
+import datetime
+import hashlib
+import heapq
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import zlib
+
+VERSION = "0.1.0"
+IMPORT_NS = "refs/braid-import"
+
+# Commit/tag headers that cannot survive a rewrite: signatures cover the old
+# object bytes, so they would be invalid (and misleading) on the new object.
+DROPPED_HEADERS = {b"gpgsig", b"gpgsig-sha256", b"mergetag"}
+SIGNATURE_MARKERS = (
+    b"-----BEGIN PGP SIGNATURE-----",
+    b"-----BEGIN SSH SIGNATURE-----",
+    b"-----BEGIN SIGNED MESSAGE-----",
+)
+TRAILER_LINE = re.compile(rb"^[A-Za-z0-9][A-Za-z0-9-]*: ")
+
+
+class BraidError(Exception):
+    """A problem the user can act on; printed without a traceback."""
+
+
+def log(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------
+# Running git
+# --------------------------------------------------------------------------
+
+def git(args, cwd=None, input=None, check=True):
+    """Run git and return stdout as bytes."""
+    proc = subprocess.run(
+        ["git"] + list(args), cwd=cwd, input=input,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise BraidError("git %s failed (exit %d):\n%s"
+                         % (" ".join(args), proc.returncode, err))
+    return proc.stdout
+
+
+def git_text(args, cwd=None, check=True):
+    return git(args, cwd=cwd, check=check).decode("utf-8", "replace").strip()
+
+
+class ObjectReader:
+    """A persistent ``git cat-file --batch`` process."""
+
+    def __init__(self, repo):
+        self.proc = subprocess.Popen(
+            ["git", "cat-file", "--batch"], cwd=repo,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+
+    def read(self, oid):
+        self.proc.stdin.write(oid.encode("ascii") + b"\n")
+        self.proc.stdin.flush()
+        header = self.proc.stdout.readline()
+        parts = header.split()
+        if len(parts) != 3:
+            raise BraidError("object %s is missing from the import" % oid)
+        size = int(parts[2])
+        data = self.proc.stdout.read(size)
+        self.proc.stdout.read(1)  # trailing newline
+        return parts[1].decode("ascii"), data
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait()
+        except OSError:
+            pass
+
+
+class ObjectWriter:
+    """Writes loose objects straight into ``.git/objects``.
+
+    Doing this natively (rather than one ``git hash-object`` per commit)
+    keeps author/committer lines byte-exact and is fast on large histories.
+    """
+
+    def __init__(self, objects_dir, algo):
+        self.objects_dir = objects_dir
+        self.algo = algo
+        self.known = set()
+        self.written = 0
+
+    def hash_only(self, obj_type, body):
+        data = b"%s %d\0" % (obj_type.encode("ascii"), len(body)) + body
+        return hashlib.new(self.algo, data).hexdigest(), data
+
+    def write(self, obj_type, body):
+        oid, data = self.hash_only(obj_type, body)
+        if oid in self.known:
+            return oid
+        subdir = os.path.join(self.objects_dir, oid[:2])
+        path = os.path.join(subdir, oid[2:])
+        if not os.path.exists(path):
+            os.makedirs(subdir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=subdir, prefix="tmp_obj_")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(zlib.compress(data))
+            # mkstemp creates 0600 files; Git's loose objects are 0444.
+            os.chmod(tmp, 0o444)
+            try:
+                os.replace(tmp, path)
+            except OSError:
+                if not os.path.exists(path):
+                    raise
+                os.remove(tmp)
+            self.written += 1
+        self.known.add(oid)
+        return oid
+
+
+# --------------------------------------------------------------------------
+# Object parsing
+# --------------------------------------------------------------------------
+
+def parse_object(raw):
+    """Split a commit or tag object into ([(key, value)], message)."""
+    header, sep, message = raw.partition(b"\n\n")
+    if not sep:
+        header = header.rstrip(b"\n")
+        message = b""
+    fields = []
+    for line in header.split(b"\n"):
+        if line.startswith(b" ") and fields:
+            key, value = fields[-1]
+            fields[-1] = (key, value + b"\n" + line)
+        else:
+            key, _, value = line.partition(b" ")
+            fields.append((key, value))
+    return fields, message
+
+
+def ident_time(value):
+    """Epoch seconds from an ident like ``Name <e@x> 1700000000 +0100``."""
+    gt = value.rfind(b">")
+    rest = value[gt + 1:].split() if gt >= 0 else value.split()[-2:]
+    try:
+        return int(rest[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+class Commit:
+    __slots__ = ("oid", "tree", "parents", "fields", "message",
+                 "author_time", "committer_time")
+
+    def __init__(self, oid, raw):
+        self.oid = oid
+        self.fields, self.message = parse_object(raw)
+        self.parents = []
+        self.tree = None
+        self.author_time = self.committer_time = 0
+        for key, value in self.fields:
+            if key == b"tree":
+                self.tree = value.decode("ascii")
+            elif key == b"parent":
+                self.parents.append(value.decode("ascii"))
+            elif key == b"author":
+                self.author_time = ident_time(value)
+            elif key == b"committer":
+                self.committer_time = ident_time(value)
+
+    def encoding(self):
+        for key, value in self.fields:
+            if key == b"encoding":
+                return value.decode("ascii", "replace")
+        return "utf-8"
+
+    def subject(self):
+        first = self.message.split(b"\n", 1)[0]
+        try:
+            return first.decode(self.encoding(), "replace")
+        except LookupError:
+            return first.decode("utf-8", "replace")
+
+
+def build_commit(commit, tree, parents, message):
+    out = [b"tree " + tree.encode("ascii")]
+    out += [b"parent " + p.encode("ascii") for p in parents]
+    for key, value in commit.fields:
+        if key in (b"tree", b"parent") or key in DROPPED_HEADERS:
+            continue
+        out.append(key + b" " + value)
+    return b"\n".join(out) + b"\n\n" + message
+
+
+def strip_signature(message):
+    """Remove an inline PGP/SSH signature block from a tag message."""
+    cut = len(message)
+    for marker in SIGNATURE_MARKERS:
+        idx = message.find(b"\n" + marker)
+        if idx >= 0:
+            cut = min(cut, idx + 1)
+        elif message.startswith(marker):
+            cut = 0
+    return message[:cut]
+
+
+def add_trailer(message, trailer):
+    body = message.rstrip(b"\n")
+    if not body:
+        return trailer + b"\n"
+    last_para = body.split(b"\n\n")[-1].split(b"\n")
+    if body.count(b"\n\n") and all(TRAILER_LINE.match(l) for l in last_para):
+        return body + b"\n" + trailer + b"\n"
+    return body + b"\n\n" + trailer + b"\n"
+
+
+def encode_for(commit, text):
+    try:
+        return text.encode(commit.encoding())
+    except (LookupError, UnicodeEncodeError):
+        return text.encode("utf-8")
+
+
+def format_time(ts):
+    # datetime arithmetic rather than time.gmtime/strftime: gmtime rejects
+    # pre-1970 values on Windows, and %-d style flags are glibc-only.
+    dt = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=ts)
+    return "%04d-%02d-%02d %02d:%02d" % (dt.year, dt.month, dt.day,
+                                         dt.hour, dt.minute)
+
+
+# --------------------------------------------------------------------------
+# Sources and validation
+# --------------------------------------------------------------------------
+
+class Source:
+    def __init__(self, idx, prefix, location, branch=None):
+        self.idx = idx
+        self.prefix = prefix
+        self.location = location
+        self.branch = branch      # as requested, or resolved later
+        self.ref = None           # full ref name in the source
+        self.tip = None
+        self.mainline = []
+        self.all_commits = []
+        self.import_ref = "%s/%d/head" % (IMPORT_NS, idx)
+        self.tags_ns = "%s/%d/tags/" % (IMPORT_NS, idx)
+
+
+def normalise_prefix(raw):
+    prefix = unicodedata.normalize("NFC", raw).replace("\\", "/").strip("/")
+    if not prefix:
+        raise BraidError("folder name must not be empty: %r" % raw)
+    for part in prefix.split("/"):
+        if part in ("", ".", ".."):
+            raise BraidError("invalid folder name %r (empty, '.' or '..' "
+                             "component)" % raw)
+        if part.casefold() == ".git":
+            raise BraidError("folder name %r may not contain '.git'" % raw)
+        if any(ord(ch) < 32 or ch == "\x7f" for ch in part):
+            raise BraidError("folder name %r contains control characters"
+                             % raw)
+    return prefix
+
+
+def check_prefix_overlap(prefixes):
+    # Compare case-insensitively: macOS (APFS/HFS+) and Windows default to
+    # case-insensitive filesystems, so "Mac" and "mac" would collide on
+    # checkout even though Git itself would store them happily.
+    folded = [(p, p.casefold()) for p in prefixes]
+    for i, (a, fa) in enumerate(folded):
+        for b, fb in folded[i + 1:]:
+            if fa == fb:
+                raise BraidError("folder names %r and %r are the same on "
+                                 "case-insensitive filesystems" % (a, b))
+            if fa.startswith(fb + "/") or fb.startswith(fa + "/"):
+                raise BraidError("folder %r and %r overlap; one cannot be "
+                                 "inside the other" % (a, b))
+
+
+def parse_sources(specs, branch_specs):
+    sources = []
+    for idx, spec in enumerate(specs):
+        if "=" not in spec:
+            raise BraidError("expected FOLDER=REPO, got %r "
+                             "(e.g. mac=../MyApp-mac)" % spec)
+        prefix, location = spec.split("=", 1)
+        if not location:
+            raise BraidError("no repository given for %r" % spec)
+        if os.path.exists(location):
+            location = os.path.abspath(location)
+        sources.append(Source(idx, normalise_prefix(prefix), location))
+    check_prefix_overlap([s.prefix for s in sources])
+
+    by_prefix = {s.prefix: s for s in sources}
+    for spec in branch_specs or []:
+        if "=" not in spec:
+            raise BraidError("expected --branch FOLDER=BRANCH, got %r" % spec)
+        prefix, branch = spec.split("=", 1)
+        prefix = normalise_prefix(prefix)
+        if prefix not in by_prefix:
+            raise BraidError("--branch %r names an unknown folder" % spec)
+        by_prefix[prefix].branch = branch
+    return sources
+
+
+def inspect_local_source(src):
+    """Catch shallow and partial clones before they fail mid-fetch."""
+    if not os.path.isdir(src.location):
+        return None
+    try:
+        shallow = git_text(["rev-parse", "--is-shallow-repository"],
+                           cwd=src.location)
+    except BraidError:
+        raise BraidError("%s is not a Git repository" % src.location)
+    if shallow == "true":
+        raise BraidError(
+            "%s is a shallow clone, so its history is incomplete.\n"
+            "Run `git fetch --unshallow` in it first." % src.location)
+    promisor = git_text(["config", "--get-regexp", r"remote\..*\.promisor"],
+                        cwd=src.location, check=False)
+    if "true" in promisor:
+        raise BraidError(
+            "%s is a partial clone (some objects were never downloaded).\n"
+            "Make a full clone of it first." % src.location)
+    fmt = git_text(["rev-parse", "--show-object-format"], cwd=src.location,
+                   check=False)
+    return fmt if fmt in ("sha1", "sha256") else "sha1"
+
+
+def resolve_branch(src):
+    if src.branch:
+        src.ref = (src.branch if src.branch.startswith("refs/")
+                   else "refs/heads/" + src.branch)
+        return
+    out = git_text(["ls-remote", "--symref", src.location, "HEAD"])
+    for line in out.splitlines():
+        if line.startswith("ref: ") and line.endswith("\tHEAD"):
+            src.ref = line[5:].split("\t")[0]
+            src.branch = src.ref.replace("refs/heads/", "", 1)
+            return
+    raise BraidError("could not tell which branch %s has checked out "
+                     "(detached HEAD?). Use --branch %s=BRANCH."
+                     % (src.location, src.prefix))
+
+
+# --------------------------------------------------------------------------
+# The braid
+# --------------------------------------------------------------------------
+
+class Braider:
+    def __init__(self, target, sources, opts):
+        self.target = target
+        self.sources = sources
+        self.opts = opts
+        self.reader = None
+        self.writer = None
+        self.commits = {}         # oid -> Commit (shared across sources)
+        self.mapping = [dict() for _ in sources]   # per source: old -> new
+        self.states = {}          # new oid -> {prefix: tree}
+        self.emitted = []         # (source, old, new) in creation order
+        self.side_count = 0
+        self.empty_tree = None
+        self.warnings = []
+        self.created_target = False
+
+    # -- setup ---------------------------------------------------------
+
+    def init_target(self):
+        if os.path.exists(self.target):
+            if not os.path.isdir(self.target) or os.listdir(self.target):
+                raise BraidError("output folder %s already exists and is not "
+                                 "empty" % self.target)
+        formats = set()
+        for src in self.sources:
+            fmt = inspect_local_source(src)
+            if fmt:
+                formats.add(fmt)
+        if len(formats) > 1:
+            raise BraidError("sources mix SHA-1 and SHA-256 repositories")
+        algo = formats.pop() if formats else "sha1"
+        init = ["init", "-q"]
+        if algo != "sha1":
+            init.append("--object-format=" + algo)
+        git(init + [self.target])
+        self.created_target = True
+        # `git init -b` needs Git 2.28+; symbolic-ref works everywhere.
+        git(["symbolic-ref", "HEAD", "refs/heads/" + self.opts.branch_name],
+            cwd=self.target)
+        objects = git_text(["rev-parse", "--git-path", "objects"],
+                           cwd=self.target)
+        if not os.path.isabs(objects):
+            objects = os.path.join(self.target, objects)
+        self.writer = ObjectWriter(objects, algo)
+        self.empty_tree = self.writer.hash_only("tree", b"")[0]
+
+    def fetch_sources(self):
+        for src in self.sources:
+            resolve_branch(src)
+            log("Fetching %s (%s) -> %s/"
+                % (src.location, src.branch, src.prefix))
+            refspecs = ["+%s:%s" % (src.ref, src.import_ref)]
+            if not self.opts.no_tags:
+                refspecs.append("+refs/tags/*:%s*" % src.tags_ns)
+            # Old histories sometimes contain objects that modern fsck
+            # rejects (zero-padded modes, odd timezones). These are the
+            # user's own repositories, so don't let a global
+            # transfer.fsckObjects=true stop the import.
+            git(["-c", "fetch.fsckObjects=false",
+                 "-c", "transfer.fsckObjects=false",
+                 "fetch", "--no-tags", "--quiet", src.location] + refspecs,
+                cwd=self.target)
+            src.tip = git_text(["rev-parse", src.import_ref], cwd=self.target)
+
+        self.reader = ObjectReader(self.target)
+        for src in self.sources:
+            src.mainline = git_text(
+                ["rev-list", "--first-parent", "--reverse", src.tip],
+                cwd=self.target).split()
+            src.all_commits = git_text(
+                ["rev-list", "--topo-order", "--reverse", src.tip],
+                cwd=self.target).split()
+            for oid in src.all_commits:
+                if oid not in self.commits:
+                    typ, raw = self.reader.read(oid)
+                    self.commits[oid] = Commit(oid, raw)
+            log("  %s/: %d commits (%d on the main line)"
+                % (src.prefix, len(src.all_commits), len(src.mainline)))
+        self.check_shared_history()
+        self.check_root_files()
+
+    def check_shared_history(self):
+        for i, a in enumerate(self.sources):
+            sa = set(a.all_commits)
+            for b in self.sources[i + 1:]:
+                shared = sa.intersection(b.all_commits)
+                if shared:
+                    self.warnings.append(
+                        "%s/ and %s/ share %d commits (one was probably "
+                        "copied from the other). Shared commits appear "
+                        "once per folder." % (a.prefix, b.prefix, len(shared)))
+
+    def root_entries(self, tree_oid):
+        _, data = self.reader.read(tree_oid)
+        names, pos = {}, 0
+        hash_len = len(bytes.fromhex(self.empty_tree))
+        while pos < len(data):
+            sp = data.index(b" ", pos)
+            nul = data.index(b"\0", sp)
+            name = data[sp + 1:nul].decode("utf-8", "replace")
+            names[name] = data[nul + 1:nul + 1 + hash_len].hex()
+            pos = nul + 1 + hash_len
+        return names
+
+    def check_root_files(self):
+        """Warn about files whose meaning depends on being at the root."""
+        for src in self.sources:
+            entries = self.root_entries(self.commits[src.tip].tree)
+            p = src.prefix
+            if ".gitmodules" in entries:
+                self.warnings.append(
+                    "%s/ uses submodules. Git only reads .gitmodules at the "
+                    "repository root, so merge %s/.gitmodules into a root "
+                    ".gitmodules (with paths prefixed by %s/)." % (p, p, p))
+            if ".github" in entries:
+                self.warnings.append(
+                    "%s/.github/ will be ignored by GitHub (workflows, issue "
+                    "templates, CODEOWNERS are read from the root only)." % p)
+            for ci in (".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml",
+                       "bitrise.yml", "codemagic.yaml"):
+                if ci in entries:
+                    self.warnings.append(
+                        "%s/%s is a CI config that is normally read from the "
+                        "repository root." % (p, ci))
+            if ".mailmap" in entries:
+                self.warnings.append(
+                    "%s/.mailmap only takes effect at the root; consider "
+                    "merging it into a root .mailmap." % p)
+            if ".git-blame-ignore-revs" in entries:
+                self.warnings.append(
+                    "%s/.git-blame-ignore-revs lists old commit IDs; rewrite "
+                    "them using the commit map file." % p)
+            if ".gitattributes" in entries:
+                _, data = self.reader.read(entries[".gitattributes"])
+                if b"filter=lfs" in data:
+                    self.warnings.append(
+                        "%s/ uses Git LFS. LFS file contents live outside "
+                        "Git and are NOT copied; run `git lfs fetch --all` "
+                        "in the source and copy .git/lfs/objects across."
+                        % p)
+
+    # -- writing -------------------------------------------------------
+
+    def write_tree(self, node):
+        entries = []
+        for name, value in node.items():
+            oid = value if isinstance(value, str) else self.write_tree(value)
+            entries.append((name.encode("utf-8"), oid))
+        # Git sorts tree entries by name, comparing subtrees as "name/".
+        entries.sort(key=lambda e: e[0] + b"/")
+        body = b"".join(b"40000 " + name + b"\0" + bytes.fromhex(oid)
+                        for name, oid in entries)
+        return self.writer.write("tree", body)
+
+    def root_tree(self, state):
+        root = {}
+        for prefix, tree in state.items():
+            if tree == self.empty_tree:
+                continue  # an empty folder can't be checked out anyway
+            parts = prefix.split("/")
+            node = root
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = tree
+        return self.write_tree(root)
+
+    def new_message(self, src, commit):
+        msg = commit.message
+        if self.opts.subject_prefix:
+            msg = encode_for(commit, self.opts.subject_prefix.format(
+                folder=src.prefix, prefix=src.prefix)) + msg
+        if self.opts.trailer:
+            msg = add_trailer(msg, encode_for(
+                commit, "Braided-From: %s %s" % (src.prefix, commit.oid)))
+        return msg
+
+    def emit(self, src, commit, state, parents):
+        tree = self.root_tree(state)
+        body = build_commit(commit, tree, parents,
+                            self.new_message(src, commit))
+        new = self.writer.write("commit", body)
+        self.mapping[src.idx][commit.oid] = new
+        self.states[new] = state
+        self.emitted.append((src, commit.oid, new))
+        if len(self.emitted) % 2000 == 0:
+            log("  ... %d commits written" % len(self.emitted))
+        return new
+
+    def ensure_side(self, src, oid):
+        """Map a commit that sits on a merged side branch (and its
+        unmapped ancestors). Iterative, as side branches can be long."""
+        mapped = self.mapping[src.idx]
+        stack = [oid]
+        while stack:
+            top = stack[-1]
+            if top in mapped:
+                stack.pop()
+                continue
+            commit = self.commits[top]
+            pending = [p for p in commit.parents if p not in mapped]
+            if pending:
+                stack.extend(reversed(pending))
+                continue
+            # The other folders stay as they were in the first parent, so
+            # the side branch only ever changes its own folder.
+            if commit.parents:
+                state = dict(self.states[mapped[commit.parents[0]]])
+            else:
+                state = {}
+            state[src.prefix] = commit.tree
+            self.emit(src, commit, state,
+                      [mapped[p] for p in commit.parents])
+            self.side_count += 1
+            stack.pop()
+        return mapped[oid]
+
+    def plan(self):
+        """Interleave the sources' main lines by date.
+
+        A k-way merge: each source's own order is always kept, even if its
+        dates go backwards (rebases, wrong clocks)."""
+        key_attr = ("author_time" if self.opts.order_by == "author"
+                    else "committer_time")
+        heap = []
+        for src in self.sources:
+            if src.mainline:
+                first = self.commits[src.mainline[0]]
+                heap.append((getattr(first, key_attr), src.idx, 0))
+        heapq.heapify(heap)
+        order = []
+        while heap:
+            _, idx, pos = heapq.heappop(heap)
+            src = self.sources[idx]
+            order.append((src, src.mainline[pos]))
+            if pos + 1 < len(src.mainline):
+                nxt = self.commits[src.mainline[pos + 1]]
+                heapq.heappush(heap, (getattr(nxt, key_attr), idx, pos + 1))
+        return order
+
+    def print_plan(self, order):
+        key_attr = ("author_time" if self.opts.order_by == "author"
+                    else "committer_time")
+        width = max(len(s.prefix) for s in self.sources)
+        for src, oid in order:
+            c = self.commits[oid]
+            merge = " (merge)" if len(c.parents) > 1 else ""
+            print("%s  %-*s  %s  %s%s" % (
+                format_time(getattr(c, key_attr)), width, src.prefix,
+                oid[:10], c.subject(), merge))
+
+    def braid(self, order):
+        state = {}
+        prev = None
+        for src, oid in order:
+            commit = self.commits[oid]
+            extra = []
+            if not self.opts.linear:
+                for p in commit.parents[1:]:
+                    extra.append(self.ensure_side(src, p))
+            state[src.prefix] = commit.tree
+            parents = ([prev] if prev else []) + extra
+            prev = self.emit(src, commit, dict(state), parents)
+        return prev
+
+    # -- refs ----------------------------------------------------------
+
+    def rewrite_tag(self, src, oid, new_name, depth=0):
+        """Rewrite an annotated tag object. Returns new oid or None."""
+        typ, raw = self.reader.read(oid)
+        if typ == "commit":
+            return self.mapping[src.idx].get(oid)
+        if typ != "tag" or depth > 10:
+            return None
+        fields, message = parse_object(raw)
+        target = target_type = None
+        for key, value in fields:
+            if key == b"object":
+                target = value.decode("ascii")
+            elif key == b"type":
+                target_type = value
+        if target_type == b"commit":
+            new_target = self.mapping[src.idx].get(target)
+        elif target_type == b"tag":
+            new_target = self.rewrite_tag(src, target, new_name, depth + 1)
+        else:
+            return None
+        if new_target is None:
+            return None
+        out = []
+        for key, value in fields:
+            if key in DROPPED_HEADERS:
+                continue
+            if key == b"object":
+                value = new_target.encode("ascii")
+            elif key == b"tag":
+                value = new_name.encode("utf-8")
+            out.append(key + b" " + value)
+        body = b"\n".join(out) + b"\n\n" + strip_signature(message)
+        return self.writer.write("tag", body)
+
+    def write_refs(self, tip):
+        lines = ["update refs/heads/%s %s" % (self.opts.branch_name, tip)]
+        tag_count, skipped = 0, 0
+        if not self.opts.no_tags:
+            for src in self.sources:
+                tag_prefix = self.opts.tag_prefix.format(
+                    folder=src.prefix, prefix=src.prefix)
+                out = git_text(["for-each-ref",
+                                "--format=%(objectname) %(refname)",
+                                src.tags_ns], cwd=self.target)
+                for line in out.splitlines():
+                    oid, ref = line.split(" ", 1)
+                    name = tag_prefix + ref[len(src.tags_ns):]
+                    new = self.rewrite_tag(src, oid, name)
+                    if new is None:
+                        skipped += 1
+                        continue
+                    lines.append("create refs/tags/%s %s" % (name, new))
+                    tag_count += 1
+        git(["update-ref", "--stdin"], cwd=self.target,
+            input=("\n".join(lines) + "\n").encode("utf-8"))
+        if skipped:
+            self.warnings.append(
+                "%d tags were skipped because they point at commits outside "
+                "the imported branches%s." % (
+                    skipped, " (or on side branches dropped by --linear)"
+                    if self.opts.linear else ""))
+        return tag_count
+
+    def drop_import_refs(self):
+        out = git_text(["for-each-ref", "--format=delete %(refname)",
+                        IMPORT_NS + "/"], cwd=self.target)
+        if out:
+            git(["update-ref", "--stdin"], cwd=self.target,
+                input=(out + "\n").encode("utf-8"))
+
+    def write_map(self):
+        path = self.opts.map_file
+        if not path:
+            git_dir = git_text(["rev-parse", "--git-dir"], cwd=self.target)
+            if not os.path.isabs(git_dir):
+                git_dir = os.path.join(self.target, git_dir)
+            path = os.path.join(git_dir, "braid-commit-map.tsv")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("folder\toriginal\tnew\n")
+            for src, old, new in self.emitted:
+                fh.write("%s\t%s\t%s\n" % (src.prefix, old, new))
+        return path
+
+    def verify(self):
+        """Check the final monorepo against the sources' tips."""
+        branch = "refs/heads/" + self.opts.branch_name
+        for src in self.sources:
+            want = self.commits[src.tip].tree
+            got = git_text(["rev-parse", "--verify", "-q",
+                            "%s:%s" % (branch, src.prefix)],
+                           cwd=self.target, check=False)
+            if want == self.empty_tree and not got:
+                continue
+            if got != want:
+                raise BraidError("verification failed: %s/ at the tip does "
+                                 "not match %s" % (src.prefix, src.location))
+            if not self.opts.linear:
+                mapped = len(self.mapping[src.idx])
+                if mapped != len(src.all_commits):
+                    raise BraidError(
+                        "verification failed: %s/ has %d commits but %d were "
+                        "written" % (src.prefix, len(src.all_commits), mapped))
+
+    def close(self):
+        if self.reader:
+            self.reader.close()
+            self.reader = None
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="git-braid",
+        description="Replay several Git repositories into one new monorepo, "
+                    "moving each into its own folder and interleaving their "
+                    "commits by date.",
+        epilog="Example: git-braid mac=../MyApp-mac gtk4=../MyApp-gtk4 "
+               "-o ../MyApp",
+    )
+    p.add_argument("sources", nargs="+", metavar="FOLDER=REPO",
+                   help="a folder name in the monorepo and the repository "
+                        "(path or URL) whose history goes into it; give two "
+                        "or more")
+    p.add_argument("-o", "--output", required=True,
+                   help="path of the new monorepo (must not exist, or be "
+                        "empty)")
+    p.add_argument("--branch", action="append", metavar="FOLDER=BRANCH",
+                   help="branch to import for FOLDER (default: the "
+                        "source's checked-out branch); repeatable")
+    p.add_argument("--branch-name", default="main",
+                   help="branch name in the monorepo (default: main)")
+    p.add_argument("--order-by", choices=("committer", "author"),
+                   default="committer",
+                   help="date used to interleave commits (default: "
+                        "committer, which follows rebases)")
+    p.add_argument("--linear", action="store_true",
+                   help="flatten each source to its first-parent history; "
+                        "merged side-branch commits are dropped")
+    p.add_argument("--subject-prefix", metavar="TEMPLATE",
+                   help="prepend to every commit message, e.g. "
+                        "'[{folder}] '")
+    p.add_argument("--trailer", action="store_true",
+                   help="add a 'Braided-From: FOLDER OLD-ID' trailer to each "
+                        "commit message")
+    p.add_argument("--no-tags", action="store_true",
+                   help="don't import tags")
+    p.add_argument("--tag-prefix", default="{folder}/", metavar="TEMPLATE",
+                   help="prefix for imported tag names (default: "
+                        "'{folder}/', so v1.0 becomes mac/v1.0)")
+    p.add_argument("--map-file", metavar="PATH",
+                   help="where to write the old->new commit ID map (default: "
+                        ".git/braid-commit-map.tsv in the monorepo)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the interleaved commit order and exit "
+                        "without creating anything")
+    p.add_argument("--no-checkout", action="store_true",
+                   help="don't populate the working tree at the end")
+    p.add_argument("--no-gc", action="store_true",
+                   help="skip the final `git gc` (faster, bigger repo)")
+    p.add_argument("--keep-import-refs", action="store_true",
+                   help="keep the original histories under "
+                        "refs/braid-import/ for comparison")
+    p.add_argument("--version", action="version",
+                   version="git-braid " + VERSION)
+    return p
+
+
+def run(argv=None):
+    opts = build_parser().parse_args(argv)
+    if len(opts.sources) < 2:
+        log("note: only one source given; this just moves it into %s/"
+            % opts.sources[0].split("=", 1)[0])
+    sources = parse_sources(opts.sources, opts.branch)
+    for template in (opts.tag_prefix, opts.subject_prefix or ""):
+        try:
+            template.format(folder="x", prefix="x")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise BraidError("bad template %r: %s (use {folder})"
+                             % (template, exc))
+    if not opts.no_tags:
+        for src in sources:
+            name = opts.tag_prefix.format(folder=src.prefix,
+                                          prefix=src.prefix)
+            check = subprocess.run(
+                ["git", "check-ref-format", "refs/tags/%sv1" % name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if check.returncode != 0:
+                raise BraidError("--tag-prefix gives invalid tag names for "
+                                 "%s/ (%r)" % (src.prefix, name))
+
+    if opts.dry_run:
+        tmp = tempfile.TemporaryDirectory(prefix="git-braid-")
+        target = os.path.join(tmp.name, "repo")
+    else:
+        tmp = None
+        target = os.path.abspath(opts.output)
+
+    braider = Braider(target, sources, opts)
+    try:
+        braider.init_target()
+        braider.fetch_sources()
+        order = braider.plan()
+        if opts.dry_run:
+            braider.print_plan(order)
+            for w in braider.warnings:
+                log("warning: " + w)
+            return 0
+        log("Writing %d commits%s..." % (
+            len(order), "" if opts.linear else " (plus merged side branches)"))
+        tip = braider.braid(order)
+        tags = braider.write_refs(tip)
+        map_path = braider.write_map()
+        if not opts.keep_import_refs:
+            braider.drop_import_refs()
+        braider.close()
+        if not opts.no_gc:
+            log("Packing (git gc)...")
+            git(["gc", "--quiet", "--prune=now"], cwd=target)
+        braider.verify()
+        if not opts.no_checkout:
+            git(["reset", "--hard", "-q"], cwd=target)
+    except BraidError:
+        if braider.created_target and not opts.dry_run:
+            log("The partial output in %s should be deleted before trying "
+                "again." % target)
+        raise
+    finally:
+        braider.close()
+        if tmp is not None:
+            tmp.cleanup()
+
+    log("")
+    log("Done: %s" % target)
+    log("  %d commits on %s (%d from merged side branches), %d tags"
+        % (len(braider.emitted), opts.branch_name, braider.side_count, tags))
+    log("  commit map: %s" % map_path)
+    for w in braider.warnings:
+        log("warning: " + w)
+    return 0
+
+
+def main(argv=None):
+    try:
+        return run(argv)
+    except BraidError as exc:
+        log("git-braid: error: %s" % exc)
+        return 1
+    except KeyboardInterrupt:
+        log("git-braid: interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

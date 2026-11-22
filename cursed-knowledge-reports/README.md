@@ -1,0 +1,1 @@
+Reports of platform gotchas met while building this project, written with the [QDVC Cursed Knowledge report template](https://github.com/qdvc-apps/qdvc-cursed-knowledge/blob/main/reports/TEMPLATE.md) and named `YYYY-MM-DD-<platform>-<short-slug>.md`. They are copied to `reports/inbox/` in the Cursed Knowledge repository.
